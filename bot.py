@@ -3,7 +3,8 @@
 Lawctopus Law School Bot — RAILWAY EDITION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ✅ Railway-compatible (ephemeral /tmp paths, env-var config)
-  ✅ Telethon upload at MAX speed — 5 MB parts, 20 parallel connections
+  ✅ Bunny CDN fast-upload for large videos (>100 MB) — bypasses Telegram rate limits
+  ✅ Telethon upload at MAX speed — 5 MB parts, 20 parallel connections (fallback)
   ✅ Live upload progress bar (current/total, speed, ETA) via Telethon callback
   ✅ Full Telegram flood-wait / rate-limit handling with exponential backoff
   ✅ yt-dlp live download progress
@@ -62,6 +63,17 @@ BOT_TOKEN = _require_env("BOT_TOKEN")
 API_ID    = int(_require_env("API_ID"))
 API_HASH  = _require_env("API_HASH")
 BASE_URL  = os.environ.get("BASE_URL", "https://www.lawctopuslawschool.com")
+
+# ── Bunny CDN (optional) ─────────────────────────────────────────
+# Set these three env vars to enable fast CDN uploads for large videos.
+# Leave unset to fall back to direct Telegram upload for all files.
+BUNNY_STORAGE_ZONE = os.environ.get("BUNNY_STORAGE_ZONE", "").strip()
+BUNNY_API_KEY      = os.environ.get("BUNNY_API_KEY", "").strip()
+BUNNY_HOSTNAME     = os.environ.get("BUNNY_HOSTNAME", "").strip()
+# Public CDN pull-zone base URL, e.g. "https://myzone.b-cdn.net"
+BUNNY_CDN_BASE_URL = os.environ.get("BUNNY_CDN_BASE_URL", "").strip()
+# Files larger than this threshold are routed through Bunny CDN
+BUNNY_THRESHOLD_BYTES = 100 * 1024 * 1024  # 100 MB
 
 # Railway has an ephemeral filesystem; /tmp is the safe writable location.
 _TMP      = Path(tempfile.gettempdir())
@@ -231,7 +243,68 @@ async def safe_send_file(
     progress_cb=None,
     is_group: bool = False,
 ) -> bool:
-    is_vid = filepath.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+    """
+    Send *filepath* to *chat_id*.
+
+    For large video files (> BUNNY_THRESHOLD_BYTES) when Bunny CDN is
+    configured, the file is first uploaded to Bunny CDN and the resulting
+    public URL is sent as a text message.  This bypasses Telegram's strict
+    upload rate limits (~300 KB/s) entirely.
+
+    For small files, or when Bunny CDN is not configured, the file is
+    uploaded directly to Telegram via Telethon as before.
+    """
+    is_vid      = filepath.suffix.lower() in {".mp4", ".mov", ".mkv", ".webm", ".avi"}
+    file_size   = filepath.stat().st_size
+    use_bunny   = (
+        is_vid
+        and _bunny_configured()
+        and file_size >= BUNNY_THRESHOLD_BYTES
+    )
+
+    # ── Fast path: upload to Bunny CDN, then share the URL ──────────
+    if use_bunny:
+        logger.info(
+            "Large video (%s) — routing through Bunny CDN: %s",
+            fmt_size(file_size), filepath.name,
+        )
+
+        # Build a progress callback that matches the (pct, done, total, speed, eta)
+        # signature used by upload_to_bunny_cdn() and feeds into the existing
+        # make_upload_progress_cb display logic.
+        bunny_prog_cb = None
+        if progress_cb:
+            # progress_cb here is the Telethon-style (current, total) coroutine
+            # produced by make_upload_progress_cb.  We wrap it so Bunny's
+            # (pct, done, total, speed, eta) signature maps onto it.
+            async def bunny_prog_cb(pct, done, total, speed, eta):  # noqa: E306
+                await progress_cb(done, total)
+
+        cdn_url = await upload_to_bunny_cdn(
+            filepath,
+            progress_cb=bunny_prog_cb,
+        )
+
+        if cdn_url:
+            # Send the CDN link as a Telegram message — instant delivery.
+            size_str = fmt_size(file_size)
+            text = (
+                f"🎬 *{filepath.stem}*\n\n"
+                f"📦 Size: `{size_str}`\n"
+                f"🔗 [Download / Watch]({cdn_url})\n\n"
+                + (f"_{caption}_" if caption else "")
+            ).strip()
+            msg = await safe_send_message(
+                tc, chat_id, text, reply_to=reply_to, is_group=is_group
+            )
+            if msg:
+                logger.info("Bunny CDN link sent to %s: %s", chat_id, cdn_url)
+                return True
+            logger.warning("Bunny CDN link message failed — falling back to direct upload")
+        else:
+            logger.warning("Bunny CDN upload failed — falling back to direct Telegram upload")
+
+    # ── Slow path: direct Telegram upload via Telethon ──────────────
     kwargs = {
         "caption": caption,
         "force_document": not is_vid,
@@ -556,6 +629,104 @@ async def download_file_fast(
         dest.unlink(missing_ok=True); return None, "Stopped"
     except Exception as e:
         return None, str(e)
+
+# ═══════════════════════════════════════════════════════════════════
+#  BUNNY CDN UPLOAD
+# ═══════════════════════════════════════════════════════════════════
+
+def _bunny_configured() -> bool:
+    """Return True only when all required Bunny CDN env vars are present."""
+    return bool(BUNNY_STORAGE_ZONE and BUNNY_API_KEY and BUNNY_HOSTNAME and BUNNY_CDN_BASE_URL)
+
+
+async def upload_to_bunny_cdn(
+    filepath: Path,
+    progress_cb=None,
+    remote_name: str = None,
+    max_retries: int = 3,
+) -> Optional[str]:
+    """
+    Upload *filepath* to Bunny CDN Storage and return the public CDN URL.
+
+    The file is streamed in 10 MB chunks via a single PUT request so that
+    the progress callback receives regular updates.  On transient errors the
+    upload is retried up to *max_retries* times with exponential back-off.
+
+    Returns the public CDN URL string on success, or None on failure.
+    """
+    if not _bunny_configured():
+        logger.debug("Bunny CDN not configured — skipping CDN upload")
+        return None
+
+    remote_name = remote_name or filepath.name
+    # Sanitise the remote filename so it is safe in a URL path
+    safe_name   = re.sub(r"[^\w.\-()]", "_", remote_name)
+    upload_url  = (
+        f"https://{BUNNY_HOSTNAME}/{BUNNY_STORAGE_ZONE}/{safe_name}"
+    )
+    public_url  = f"{BUNNY_CDN_BASE_URL.rstrip('/')}/{safe_name}"
+
+    file_size = filepath.stat().st_size
+    CHUNK     = 10 * 1024 * 1024  # 10 MB chunks
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            uploaded = 0
+            t0       = time.time()
+
+            async def _body_gen():
+                nonlocal uploaded
+                async with aiofiles.open(filepath, "rb") as fh:
+                    while True:
+                        chunk = await fh.read(CHUNK)
+                        if not chunk:
+                            break
+                        uploaded += len(chunk)
+                        if progress_cb:
+                            elapsed = max(time.time() - t0, 0.1)
+                            speed   = uploaded / elapsed
+                            pct     = (uploaded / file_size * 100) if file_size else 0
+                            eta     = int((file_size - uploaded) / speed) if speed > 0 and file_size > uploaded else 0
+                            await progress_cb(pct, uploaded, file_size, speed, eta)
+                        yield chunk
+
+            async with httpx.AsyncClient(
+                timeout=httpx.Timeout(connect=30, read=600, write=600, pool=30),
+            ) as client:
+                resp = await client.put(
+                    upload_url,
+                    content=_body_gen(),
+                    headers={
+                        "AccessKey":     BUNNY_API_KEY,
+                        "Content-Type":  "application/octet-stream",
+                        "Content-Length": str(file_size),
+                    },
+                )
+
+            if resp.status_code in (200, 201):
+                logger.info(
+                    "Bunny CDN upload OK: %s (%s) → %s",
+                    filepath.name, fmt_size(file_size), public_url,
+                )
+                return public_url
+
+            logger.warning(
+                "Bunny CDN attempt %d/%d: HTTP %d — %s",
+                attempt, max_retries, resp.status_code, resp.text[:200],
+            )
+
+        except Exception as exc:
+            logger.warning(
+                "Bunny CDN attempt %d/%d error: %s",
+                attempt, max_retries, exc,
+            )
+
+        if attempt < max_retries:
+            await asyncio.sleep(2 ** attempt)
+
+    logger.error("Bunny CDN upload failed after %d attempts: %s", max_retries, filepath.name)
+    return None
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  COURSE DATA

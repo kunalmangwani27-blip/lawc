@@ -3,7 +3,7 @@
 Lawctopus Law School Bot — RAILWAY EDITION
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   ✅ Railway-compatible (ephemeral /tmp paths, env-var config)
-  ✅ Telethon upload at MAX speed — 512 KB parts, 10 parallel connections
+  ✅ Telethon upload at MAX speed — 5 MB parts, 20 parallel connections
   ✅ Live upload progress bar (current/total, speed, ETA) via Telethon callback
   ✅ Full Telegram flood-wait / rate-limit handling with exponential backoff
   ✅ yt-dlp live download progress
@@ -75,8 +75,8 @@ INTER_MSG_DELAY   = 0.5
 GROUP_MSG_DELAY   = 1.5
 MAX_FLOOD_RETRIES = 8
 
-UPLOAD_PART_KB  = 512
-UPLOAD_WORKERS  = 10
+UPLOAD_PART_KB  = 5120   # 5 MB parts — reduces per-chunk overhead for large files
+UPLOAD_WORKERS  = 20     # 20 parallel connections — maximises throughput to Telegram
 
 HEADERS = {
     "User-Agent": (
@@ -518,11 +518,17 @@ async def download_video_ytdlp(
 async def download_file_fast(
     url: str, dest: Path, progress_cb=None, uid: int = 0
 ) -> Tuple[Optional[Path], Optional[str]]:
-    CHUNK = 2 * 1024 * 1024
+    CHUNK = 10 * 1024 * 1024  # 10 MB read chunks — amortises async overhead on fast links
     try:
         async with httpx.AsyncClient(
             headers=HEADERS, follow_redirects=True,
             timeout=httpx.Timeout(connect=15, read=300, write=60, pool=15),
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=30,
+            ),
+            http2=False,  # HTTP/1.1 keep-alive is more reliable for large binary streams
         ) as client:
             async with client.stream("GET", url) as resp:
                 resp.raise_for_status()
